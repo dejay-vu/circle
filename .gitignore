@@ -1,0 +1,5 @@
+wandb
+checkpoints* 
+*.zarr
+pretrained
+__pycache__
