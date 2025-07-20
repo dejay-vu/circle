@@ -18,21 +18,13 @@ from torch.utils.data import (
 )
 from torchvision.ops import sigmoid_focal_loss
 from tqdm import tqdm, trange
+from triton import next_power_of_2
 from vq_vae import Encoder, vq_vae
 from world_model import MiniWorldModel
 
 is_amp = True
-
-run = wandb.init(
-    project="pretrain-world-model",
-    name="Multigames-50k",
-    config={
-        "batch_size": 256,
-        "epochs": 1000,
-        "learning_rate": 1e-4,
-        "horizon": 16,
-    },
-)
+amp_dtype = torch.float16
+horizon = 8
 
 encoder_state = load_file("pretrained/encoder.safetensors")
 vq_state = load_file("pretrained/vq.safetensors")
@@ -41,12 +33,12 @@ decoder_state = load_file("pretrained/decoder.safetensors")
 
 # %%
 class MultiTrajectoryDataset(Dataset):
-    def __init__(self, games, horizon=8):
+
+    def __init__(self, games, horizon):
         self.root = zarr.open_group("dataset50k.zarr", mode="r")
         self.games = games
         self.horizon = horizon
         self.data = []
-        self.weights = []
 
         for gid, game in enumerate(self.games):
             frames = self.root[game]["frames"][:]
@@ -54,27 +46,81 @@ class MultiTrajectoryDataset(Dataset):
             rewards = self.root[game]["rewards"][:]
             dones = self.root[game]["dones"][:]
 
-            for idx in trange(len(frames) - horizon):
-                # check if any done in the horizon (to avoid crossing episode boundary)
-                if dones[idx : idx + horizon].any():
-                    continue
+            # number of dones
+            print(f"Game {game} has {dones.sum()} dones")
 
-                frame_seq = frames[idx : idx + horizon, -1]  # (H, 3, 84, 84)
-                action_seq = actions[idx : idx + horizon]  # (H,)
-                reward_seq = rewards[idx : idx + horizon]  # (H,)
+            # number of non-zero rewards
+            print(
+                f"Game {game} has {len(rewards[rewards != 0])} non-zero rewards"
+            )
 
-                self.data.append((frame_seq, action_seq, reward_seq, gid))
+            for idx in trange(len(frames) - horizon - 1):
+                end = idx + horizon
+                done_pos = np.where(dones[idx:end] == True)[0]
+                if len(done_pos) > 0:
+                    end = idx + done_pos[0] + 1  # include the done frame
+
+                frame_seq = frames[idx : end + 1, -1]  # (H+1, 3, 84, 84)
+                action_seq = actions[idx:end]  # (H,)
+                reward_seq = rewards[idx:end]  # (H,)
+                done_seq = dones[idx:end]  # (H,)
+
+                seq_len = end - idx
+                mask_seq = np.zeros(horizon, dtype=bool)
+                mask_seq[:seq_len] = True  # (H,)
+
+                if seq_len < horizon:
+                    pad_len = horizon - seq_len
+                    frame_seq = np.pad(
+                        frame_seq,
+                        ((0, pad_len), (0, 0), (0, 0), (0, 0)),
+                        mode="constant",
+                        constant_values=0,
+                    )
+                    action_seq = np.pad(
+                        action_seq,
+                        (0, pad_len),
+                        mode="constant",
+                        constant_values=18,
+                    )
+                    reward_seq = np.pad(
+                        reward_seq,
+                        (0, pad_len),
+                        mode="constant",
+                        constant_values=0.0,
+                    )
+                    done_seq = np.pad(
+                        done_seq,
+                        (0, pad_len),
+                        mode="constant",
+                        constant_values=False,
+                    )
+
+                self.data.append(
+                    (
+                        frame_seq,
+                        action_seq,
+                        reward_seq,
+                        done_seq,
+                        mask_seq,
+                        gid,
+                    )
+                )
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
-        frame_seq, action_seq, reward_seq, gid = self.data[idx]
+        frame_seq, action_seq, reward_seq, done_seq, mask_seq, gid = self.data[
+            idx
+        ]
 
         return (
             torch.from_numpy(frame_seq).float().div_(255),  # (H, 3, 84, 84)
             torch.from_numpy(action_seq).long(),  # (H,)
             torch.from_numpy(reward_seq).float(),  # (H,)
+            torch.from_numpy(done_seq).bool(),  # (H,)
+            torch.from_numpy(mask_seq).bool(),  # (H,)
             torch.tensor(gid, dtype=torch.long),  # game id
         )
 
@@ -85,7 +131,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 task_embed = TaskEmbed(num_known_tasks=6).to(device)
 
 # Initialize models
-world_model = MiniWorldModel(num_actions=18, task_embed=task_embed).to(device)
+world_model = MiniWorldModel(task_embed=task_embed).to(device)
 
 # Load pretrained weights
 encoder = Encoder().to(device)
@@ -93,30 +139,39 @@ quantizer = vq_vae.to(device)
 encoder.load_state_dict(encoder_state)
 quantizer.load_state_dict(vq_state)
 
+# world_model = torch.compile(world_model, mode="default")
 world_model.train()
 encoder.eval()
 quantizer.eval()
 
+base_lr = 1e-4
+obs_head_lr = 3e-4
+reward_head_lr = 1e-5
+done_head_lr = 1e-5
+weight_decay = 1e-2
 optimizer = torch.optim.AdamW(
     [
         {
             "params": (
                 list(world_model.transformer.parameters())
-                + list(world_model.action_embed.parameters())
                 + list(world_model.task_embed.parameters())
-                + [world_model.pos]
             ),
-            "lr": 3e-4,
-            "weight_decay": 1e-5,
+            "lr": base_lr,
+            "weight_decay": weight_decay,
         },
         {
             "params": (list(world_model.obs_head.parameters())),
-            "lr": 1e-4,
-            "weight_decay": 1e-5,
+            "lr": obs_head_lr,
+            "weight_decay": weight_decay,
         },
         {
             "params": (list(world_model.reward_head.parameters())),
-            "lr": 1e-5,
+            "lr": reward_head_lr,
+            "weight_decay": 0.0,
+        },
+        {
+            "params": (list(world_model.done_head.parameters())),
+            "lr": done_head_lr,
             "weight_decay": 0.0,
         },
     ]
@@ -133,7 +188,7 @@ games = [
     "StarGunner",
     "MsPacman",
 ]
-dataset = MultiTrajectoryDataset(games, horizon=10)
+dataset = MultiTrajectoryDataset(games, horizon=horizon)
 
 rng = np.random.default_rng(seed=42)
 indices = np.arange(len(dataset))
@@ -145,9 +200,9 @@ val_indices = perm[split:]
 train_subset = Subset(dataset, train_indices)
 val_subset = Subset(dataset, val_indices)
 
-train_sampler = RandomSampler(train_subset, replacement=True)
+train_sampler = RandomSampler(train_subset)
 
-batch_size = 384
+batch_size = 512
 train_loader = DataLoader(
     train_subset,
     batch_size=batch_size,
@@ -165,23 +220,153 @@ val_loader = DataLoader(
     pin_memory=True,
 )
 
+
 # %%
-alpha = 0.25
+@torch.no_grad()
+def preprocess_batch(
+    frames,
+    actions,
+    rewards,
+    dones,
+    masks,
+    game_ids,
+    device,
+):
+    B, T = actions.shape
+
+    frames = frames.reshape(-1, 3, 84, 84).to(device, non_blocking=True)
+    actions = actions.to(device, non_blocking=True)
+    rewards = rewards.to(device, non_blocking=True)
+    dones = dones.to(device, non_blocking=True)
+    masks = masks.to(device, non_blocking=True)
+    game_ids = game_ids.to(device, non_blocking=True)
+
+    with autocast(device_type="cuda", dtype=amp_dtype, enabled=is_amp):
+        z_e = encoder(frames)
+        _, indices, _ = quantizer(z_e)
+        indices = indices.reshape(B, T + 1, 16)  # (B, T+1, 16)
+        curr_obs_tokens = indices[:, :-1]  # (B, T, 16)
+        next_obs_tokens = indices[:, 1:]  # (B, T, 16)
+
+    return (
+        curr_obs_tokens,
+        next_obs_tokens,
+        actions,
+        rewards,
+        dones,
+        masks,
+        game_ids,
+    )
+
+
+def compute_loss(
+    world_model,
+    curr_obs_tokens,
+    next_obs_tokens,
+    actions,
+    rewards,
+    dones,
+    obs_masks,
+    seq_masks,
+    game_ids,
+):
+    pred_next_obs_tokens_logits, pred_reward, pred_done = world_model(
+        curr_obs_tokens, actions, game_ids
+    )  # (B, T, 16, 512), (B, T), (B, T)
+
+    obs_loss = F.cross_entropy(
+        pred_next_obs_tokens_logits.reshape(-1, 512),  # (B*T*16, 512)
+        next_obs_tokens.reshape(-1),  # (B*T*16,)
+        reduction="none",
+    )  # (B*T*16,)
+    obs_loss = obs_loss[obs_masks].mean()
+
+    reward_target = (rewards.abs() > 1e-6).float()
+    reward_loss = sigmoid_focal_loss(
+        pred_reward.reshape(-1),  # (B*T,)
+        reward_target.reshape(-1),  # (B*T,)
+        reduction="none",
+        alpha=alpha,
+        gamma=gamma,
+    )
+    reward_loss = reward_loss[seq_masks].mean()
+
+    done_target = dones.float()
+    done_loss = sigmoid_focal_loss(
+        pred_done.reshape(-1),  # (B*T,)
+        done_target.reshape(-1),  # (B*T,)
+        reduction="none",
+        alpha=alpha,
+        gamma=gamma,
+    )
+    done_loss = done_loss[seq_masks].mean()
+
+    return (
+        obs_loss,
+        reward_loss,
+        done_loss,
+        reward_target,
+        pred_reward,
+        done_target,
+        pred_done,
+    )
+
+
+def compute_prf(
+    tp: int,
+    fp: int,
+    pos: int,
+    *,
+    nan_when_no_pos=True,
+    nan_when_no_pred_pos=False,
+    eps=1e-12,
+):
+    pred_pos = tp + fp
+
+    if pos == 0:
+        if nan_when_no_pos:
+            return dict(
+                precision=float("nan"), recall=float("nan"), f1=float("nan")
+            )
+        else:
+            # 定义为 0
+            return dict(precision=0.0, recall=float("nan"), f1=float("nan"))
+
+    if pred_pos == 0:
+        # 没预测正
+        if nan_when_no_pred_pos:
+            return dict(precision=float("nan"), recall=0.0, f1=float("nan"))
+        else:
+            return dict(precision=0.0, recall=0.0, f1=0.0)
+
+    precision = tp / (pred_pos + eps)
+    recall = tp / (pos + eps)
+    if precision + recall == 0:
+        f1 = 0.0
+    else:
+        f1 = 2 * precision * recall / (precision + recall)
+
+    return precision, recall, f1
+
+
+# %%
+alpha = 0.75
 gamma = 2.0
 
 
-def validate(global_step, reward_weight):
+@torch.inference_mode()
+def validate(global_step):
+    world_model.eval()
+
     obs_loss_sum = 0.0
     reward_loss_sum = 0.0
-    token_cnt = 0
-    tp = pos = fp = 0
+    done_loss_sum = 0.0
 
-    val_game_obs_loss_sum = {gid: 0.0 for gid in range(6)}
-    val_game_reward_loss_sum = {gid: 0.0 for gid in range(6)}
-    val_game_token_cnt = {gid: 0 for gid in range(6)}
-    val_game_tp = {gid: 0 for gid in range(6)}
-    val_game_pos = {gid: 0 for gid in range(6)}
-    val_game_fp = {gid: 0 for gid in range(6)}
+    valid_obs_cnt = 0
+    valid_steps_cnt = 0
+
+    reward_tp = reward_fp = reward_pos = 0
+    done_tp = done_fp = done_pos = 0
 
     val_bar = tqdm(
         val_loader,
@@ -189,283 +374,263 @@ def validate(global_step, reward_weight):
         desc=f"Validating at step {global_step}",
     )
 
-    world_model.eval()
-    with torch.no_grad():
-        for frames, actions, rewards, game_ids in val_bar:
-            B, T, C, Ht, Wt = frames.shape
-
-            frames = frames.view(-1, 3, 84, 84).to(
-                device, dtype=torch.float32, non_blocking=True
+    for frames, actions, rewards, dones, masks, game_ids in val_bar:
+        with autocast(device_type="cuda", dtype=amp_dtype, enabled=is_amp):
+            (
+                curr_obs_tokens,
+                next_obs_tokens,
+                actions,
+                rewards,
+                dones,
+                masks,
+                game_ids,
+            ) = preprocess_batch(
+                frames, actions, rewards, dones, masks, game_ids, device
             )
-            actions = actions.to(device, dtype=torch.long, non_blocking=True)
-            rewards = rewards.to(
-                device, dtype=torch.float32, non_blocking=True
+
+            flat_masks = masks.reshape(-1)  # (B*T,)
+            repeated_masks = torch.repeat_interleave(
+                flat_masks, 16
+            )  # (B*T*16,)
+
+            (
+                obs_loss,
+                reward_loss,
+                done_loss,
+                reward_target,
+                pred_reward,
+                done_target,
+                pred_done,
+            ) = compute_loss(
+                world_model,
+                curr_obs_tokens,
+                next_obs_tokens,
+                actions,
+                rewards,
+                dones,
+                obs_masks=repeated_masks,
+                seq_masks=flat_masks,
+                game_ids=game_ids,
             )
-            game_ids = game_ids.to(device)
 
-            with autocast(device_type="cuda", enabled=is_amp):
-                # 移动到 autocast 内
-                z_e = encoder(frames)
-                _, indices, _ = quantizer(z_e)
-                obs_tokens = indices.view(B, T, 16)
+        num_valid_obs_tokens = repeated_masks.sum().item()
+        num_valid_steps = flat_masks.sum().item()
+        valid_obs_cnt += num_valid_obs_tokens
+        valid_steps_cnt += num_valid_steps
+        obs_loss_sum += obs_loss.item() * num_valid_obs_tokens
+        reward_loss_sum += reward_loss.item() * num_valid_steps
+        done_loss_sum += done_loss.item() * num_valid_steps
 
-                pred_obs_logits, pred_rewards = world_model(
-                    obs_tokens, actions, game_ids
-                )
+        reward_prob = torch.sigmoid(pred_reward)
+        reward_pred = reward_prob > 0.5
+        reward_tp += (reward_pred & reward_target.bool()).sum().item()
+        reward_pos += reward_target.sum().item()
+        reward_fp += (reward_pred & (~reward_target.bool())).sum().item()
 
-                obs_loss = F.cross_entropy(
-                    pred_obs_logits.reshape(-1, 512),  # (B*T*16, 512)
-                    obs_tokens.reshape(-1),  # (B*T*16,)
-                    reduction="mean",
-                )
-                reward_target = (rewards.abs() > 1e-6).float()
-                reward_loss = sigmoid_focal_loss(
-                    pred_rewards,
-                    reward_target,
-                    reduction="mean",
-                    alpha=alpha,
-                    gamma=gamma,
-                )
+        done_prob = torch.sigmoid(pred_done)
+        done_pred = done_prob > 0.5
+        done_tp += (done_pred & done_target.bool()).sum().item()
+        done_pos += done_target.sum().item()
+        done_fp += (done_pred & (~done_target.bool())).sum().item()
 
-            batch_tokens = obs_tokens.numel()
-            obs_loss_sum += obs_loss.item() * batch_tokens
-            reward_loss_sum += reward_loss.item() * batch_tokens
-            token_cnt += batch_tokens
+    obs_loss_epoch = obs_loss_sum / valid_obs_cnt if valid_obs_cnt > 0 else 0
+    reward_loss_epoch = (
+        reward_loss_sum / valid_steps_cnt if valid_steps_cnt > 0 else 0
+    )
+    done_loss_epoch = (
+        done_loss_sum / valid_steps_cnt if valid_steps_cnt > 0 else 0
+    )
 
-            # 分组计算 losses 和 tp/fp
-            unique_gids = game_ids.unique()
-            for g in unique_gids:
-                mask = game_ids == g
-                if mask.sum() == 0:
-                    continue
+    total_loss_epoch = obs_loss_epoch + reward_loss_epoch + done_loss_epoch
 
-                # Slice
-                obs_tokens_g = obs_tokens[mask]
-                pred_obs_logits_g = pred_obs_logits[mask]
-                rewards_g = rewards[mask]
-                pred_rewards_g = pred_rewards[mask]
+    reward_precision, reward_recall, reward_f1 = compute_prf(
+        reward_tp,
+        reward_fp,
+        reward_pos,
+        nan_when_no_pos=False,
+        nan_when_no_pred_pos=True,
+    )
 
-                # Group losses (用全局 gamma)
-                obs_loss_g = F.cross_entropy(
-                    pred_obs_logits_g.reshape(-1, 512),
-                    obs_tokens_g.reshape(-1),
-                    reduction="mean",
-                )
-                reward_target_g = (rewards_g.abs() > 1e-6).float()
-                reward_loss_g = sigmoid_focal_loss(
-                    pred_rewards_g,
-                    reward_target_g,
-                    reduction="mean",
-                    alpha=alpha,
-                    gamma=gamma,
-                )
+    done_precision, done_recall, done_f1 = compute_prf(
+        done_tp,
+        done_fp,
+        done_pos,
+        nan_when_no_pos=False,
+        nan_when_no_pred_pos=True,
+    )
 
-                tokens_g = obs_tokens_g.numel()
-                gid = g.item()
-                val_game_obs_loss_sum[gid] += obs_loss_g.item() * tokens_g
-                val_game_reward_loss_sum[gid] += (
-                    reward_loss_g.item() * tokens_g
-                )
-                val_game_token_cnt[gid] += tokens_g
+    wandb.log(
+        {
+            "val/obs_loss": obs_loss_epoch,
+            "val/reward_loss": reward_loss_epoch,
+            "val/done_loss": done_loss_epoch,
+            "val/total_loss": total_loss_epoch,
+            "val/reward-recall": reward_recall,
+            "val/reward-precision": reward_precision,
+            "val/reward-f1": reward_f1,
+            "val/done-recall": done_recall,
+            "val/done-precision": done_precision,
+            "val/done-f1": done_f1,
+        },
+        step=global_step,
+    )
 
-                # 分组计算 tp/fp (替换原 per-sample)
-                prob_g = torch.sigmoid(pred_rewards_g)
-                pred_g = prob_g > 0.5
-                target_g = reward_target_g.bool()  # 用 bool 以匹配
-                val_game_tp[gid] += (pred_g & target_g).sum().item()
-                val_game_pos[gid] += target_g.sum().item()
-                val_game_fp[gid] += (pred_g & (~target_g)).sum().item()
-
-            # 整体 tp/fp (保持)
-
-            prob = torch.sigmoid(pred_rewards)
-            pred = prob > 0.5
-            tp += (pred & reward_target.bool()).sum().item()
-            pos += reward_target.sum().item()
-            fp += (pred & (~reward_target.bool())).sum().item()
-
-        # 移动到循环外：计算 avg 和 log
-        for gid in range(6):
-            if val_game_token_cnt[gid] > 0:
-                obs_loss_game = (
-                    val_game_obs_loss_sum[gid] / val_game_token_cnt[gid]
-                )
-                reward_loss_game = (
-                    val_game_reward_loss_sum[gid] / val_game_token_cnt[gid]
-                )
-                weighted_reward_loss_game = reward_loss_game * reward_weight
-                total_loss_game = obs_loss_game + weighted_reward_loss_game
-                recall_game = (
-                    val_game_tp[gid] / val_game_pos[gid]
-                    if val_game_pos[gid]
-                    else float("nan")
-                )
-                precision_game = (
-                    val_game_tp[gid] / (val_game_tp[gid] + val_game_fp[gid])
-                    if (val_game_tp[gid] + val_game_fp[gid])
-                    else float("nan")
-                )
-                f1_game = (
-                    (
-                        2
-                        * precision_game
-                        * recall_game
-                        / (precision_game + recall_game)
-                    )
-                    if precision_game and recall_game
-                    else float("nan")
-                )
-
-                wandb.log(
-                    {
-                        f"val/game_{games[gid]}/obs_loss": obs_loss_game,
-                        f"val/game_{games[gid]}/raw_reward_loss": reward_loss_game,  # 区分 raw
-                        f"val/game_{games[gid]}/weighted_reward_loss": weighted_reward_loss_game,
-                        f"val/game_{games[gid]}/total_loss": total_loss_game,
-                        f"val/game_{games[gid]}/recall": recall_game,
-                        f"val/game_{games[gid]}/precision": precision_game,
-                        f"val/game_{games[gid]}/f1": f1_game,
-                    },
-                    step=global_step,
-                )
-
-        obs_loss_epoch = obs_loss_sum / token_cnt
-        reward_loss_epoch = reward_loss_sum / token_cnt
-        weighted_reward_loss_epoch = reward_loss_epoch * reward_weight
-        total_loss_epoch = obs_loss_epoch + weighted_reward_loss_epoch
-
-        recall = tp / pos if pos else float("nan")
-        precision = tp / (tp + fp) if (tp + fp) else float("nan")
-        f1 = (
-            (2 * precision * recall / (precision + recall))
-            if precision and recall
-            else float("nan")
-        )
-
-        wandb.log(
-            {
-                "all_val/obs_loss": obs_loss_epoch,
-                "all_val/raw_reward_loss": reward_loss_epoch,  # 区分
-                "all_val/weighted_reward_loss": weighted_reward_loss_epoch,
-                "all_val/total_loss": total_loss_epoch,
-                "all_val/recall": recall,
-                "all_val/precision": precision,
-                "all_val/f1": f1,
-            },
-            step=global_step,
-        )
-
-        # scheduler.step(reward_loss_epoch)
+    # scheduler.step(reward_loss_epoch)
 
     return total_loss_epoch
 
 
 # %%
-best_val_loss = float("inf")
-checkpoint_dir = "checkpoints_new"
-os.makedirs(checkpoint_dir, exist_ok=True)
+if __name__ == "__main__":
+    best_val_loss = float("inf")
+    checkpoint_dir = "checkpoints_new"
+    os.makedirs(checkpoint_dir, exist_ok=True)
 
-patience = 5  # 连续5次val不改善就stop
-early_stop_counter = 0
-min_delta = 0.0001  # 最小改善阈值
+    scaler = GradScaler(enabled=is_amp)
 
-wandb.watch(world_model, log="gradients", log_freq=1000)
-scaler = GradScaler(enabled=is_amp)
-global_step = 0
+    patience = 5  # 连续5次val不改善就stop
+    early_stop_counter = 0
+    min_delta = 0.0001  # 最小改善阈值
 
-initial_reward_weight = 1.0  # 初始值，根据日志调优
-decay_rate = 1.0  # 每 epoch 衰减率
-min_reward_weight = 1.0  # 最小值，防止过低
+    run = wandb.init(
+        project="pretrain-world-model",
+        name="Multigames-50k",
+        config={
+            "batch_size": batch_size,
+            "base_lr": base_lr,
+            "obs_head_lr": obs_head_lr,
+            "reward_head_lr": reward_head_lr,
+            "done_head_lr": done_head_lr,
+            "weight_decay": weight_decay,
+            "horizon": horizon,
+            "alpha": alpha,
+            "gamma": gamma,
+        },
+    )
+    wandb.watch(world_model, log="all", log_freq=1000)
 
-for epoch in range(1000):
-    bar = tqdm(train_loader, leave=True, desc=f"Epoch {epoch + 1:02d}")
-    world_model.train()
-    for frames, actions, rewards, game_ids in bar:
-        global_step += 1
+    global_step = 0
+    for epoch in range(1000):
+        bar = tqdm(train_loader, leave=True, desc=f"Epoch {epoch + 1:02d}")
+        world_model.train()
+        for frames, actions, rewards, dones, masks, game_ids in bar:
+            global_step += 1
 
-        B, T, C, Ht, Wt = frames.shape
+            with autocast(device_type="cuda", dtype=amp_dtype, enabled=is_amp):
+                (
+                    curr_obs_tokens,
+                    next_obs_tokens,
+                    actions,
+                    rewards,
+                    dones,
+                    masks,
+                    game_ids,
+                ) = preprocess_batch(
+                    frames, actions, rewards, dones, masks, game_ids, device
+                )
 
-        frames = frames.view(-1, 3, 84, 84).to(
-            device, dtype=torch.float32, non_blocking=True
-        )
-        actions = actions.to(device, dtype=torch.long, non_blocking=True)
-        rewards = rewards.to(device, dtype=torch.float32, non_blocking=True)
-        game_ids = game_ids.to(device)
+                flat_masks = masks.reshape(-1)  # (B*T,)
+                repeated_masks = torch.repeat_interleave(
+                    flat_masks, 16
+                )  # (B*T*16,)
 
-        with torch.no_grad():
-            z_e = encoder(frames)
-            _, indices, _ = quantizer(z_e)
-            obs_tokens = indices.view(B, T, 16)
+                (
+                    obs_loss,
+                    reward_loss,
+                    done_loss,
+                    reward_target,
+                    pred_reward,
+                    done_target,
+                    pred_done,
+                ) = compute_loss(
+                    world_model,
+                    curr_obs_tokens,
+                    next_obs_tokens,
+                    actions,
+                    rewards,
+                    dones,
+                    obs_masks=repeated_masks,
+                    seq_masks=flat_masks,
+                    game_ids=game_ids,
+                )
 
-        with autocast(device_type="cuda", enabled=is_amp):
-            pred_obs_logits, pred_rewards = world_model(
-                obs_tokens, actions, game_ids
+            loss = obs_loss + reward_loss + done_loss
+
+            optimizer.zero_grad()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            reward_prob = torch.sigmoid(pred_reward)
+            reward_pred = reward_prob > 0.5
+            reward_tp = (reward_pred & reward_target.bool()).sum().item()
+            reward_pos = reward_target.sum().item()
+            reward_fp = (reward_pred & (~reward_target.bool())).sum().item()
+
+            done_prob = torch.sigmoid(pred_done)
+            done_pred = done_prob > 0.5
+            done_tp = (done_pred & done_target.bool()).sum().item()
+            done_pos = done_target.sum().item()
+            done_fp = (done_pred & (~done_target.bool())).sum().item()
+
+            reward_precision, reward_recall, reward_f1 = compute_prf(
+                reward_tp,
+                reward_fp,
+                reward_pos,
+                nan_when_no_pos=False,
+                nan_when_no_pred_pos=True,
             )
 
-            obs_loss = F.cross_entropy(
-                pred_obs_logits.reshape(-1, 512),
-                obs_tokens.reshape(-1),
-                reduction="mean",
+            done_precision, done_recall, done_f1 = compute_prf(
+                done_tp,
+                done_fp,
+                done_pos,
+                nan_when_no_pos=False,
+                nan_when_no_pred_pos=True,
             )
 
-            reward_target = (rewards.abs() > 1e-6).float()
-            reward_loss = sigmoid_focal_loss(
-                pred_rewards,
-                reward_target,
-                reduction="mean",
-                alpha=alpha,
-                gamma=gamma,
+            wandb.log(
+                {
+                    "train/learning_rate": optimizer.param_groups[0]["lr"],
+                    "train/obs_loss": obs_loss.item(),
+                    "train/reward_loss": reward_loss.item(),
+                    "train/done_loss": done_loss.item(),
+                    "train/total_loss": loss.item(),
+                    "train/reward-recall": reward_recall,
+                    "train/reward-precision": reward_precision,
+                    "train/reward-f1": reward_f1,
+                    "train/done-recall": done_recall,
+                    "train/done-precision": done_precision,
+                    "train/done-f1": done_f1,
+                },
+                step=global_step,
             )
 
-            reward_weight = max(
-                initial_reward_weight * (decay_rate**epoch), min_reward_weight
+            bar.set_postfix(
+                obs_loss=obs_loss.item(),
+                reward_loss=reward_loss.item(),
+                done_loss=done_loss.item(),
+                loss=loss.item(),
             )
-            weighted_reward_loss = reward_loss * reward_weight
-            loss = obs_loss + weighted_reward_loss
 
-        optimizer.zero_grad()
-        scaler.scale(loss).backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            world_model.parameters(), max_norm=1.0, norm_type=2.0
-        )
-        scaler.step(optimizer)
-        scaler.update()
+        total_loss_epoch = validate(global_step)
 
-        wandb.log(
-            {
-                "train/learning_rate": optimizer.param_groups[0]["lr"],
-                "train/obs_loss": obs_loss.item(),
-                "train/reward_loss": weighted_reward_loss.item(),
-                "train/loss": loss.item(),
-                "train/grad_norm": grad_norm.item(),
-            },
-            step=global_step,
-        )
+        if total_loss_epoch < best_val_loss - min_delta:
+            best_val_loss = total_loss_epoch
+            early_stop_counter = 0
+            wm_path = os.path.join(
+                checkpoint_dir, f"best_model_step_{global_step}.safetensors"
+            )
+            te_path = os.path.join(
+                checkpoint_dir, f"task_embed_step_{global_step}.safetensors"
+            )
 
-        bar.set_postfix(
-            obs_loss=obs_loss.item(),
-            reward_loss=weighted_reward_loss.item(),
-            loss=loss.item(),
-        )
+            save_file(world_model.state_dict(), wm_path)
+            save_file(task_embed.state_dict(), te_path)
+        else:
+            early_stop_counter += 1
+            if early_stop_counter >= patience:
+                print(f"Early stopping at step {global_step}")
+                break
 
-    total_loss_epoch = validate(global_step, reward_weight)
-
-    if total_loss_epoch < best_val_loss - min_delta:
-        best_val_loss = total_loss_epoch
-        early_stop_counter = 0
-        wm_path = os.path.join(
-            checkpoint_dir, f"best_model_step_{global_step}.safetensors"
-        )
-        te_path = os.path.join(
-            checkpoint_dir, f"task_embed_step_{global_step}.safetensors"
-        )
-
-        save_file(world_model.state_dict(), wm_path)
-        save_file(task_embed.state_dict(), te_path)
-    else:
-        early_stop_counter += 1
-        if early_stop_counter >= patience:
-            print(f"Early stopping at step {global_step}")
-            break
-
-run.finish()
+    run.finish()

@@ -1,32 +1,22 @@
 import torch
 import torch.nn as nn
+from flash_transformer_encoder import FlashTransformerEncoder
 from task_embed import TaskEmbed
 from torch.distributions import Categorical
 
 
 class MiniWorldModel(nn.Module):
-    def __init__(self, task_embed: TaskEmbed, num_actions=18):
+    def __init__(self, task_embed: TaskEmbed):
         super().__init__()
-        self.num_actions = num_actions
-        self.action_embed = nn.Embedding(
-            num_actions, 256
-        )  # num_actions tokens, 256 dim
         self.task_embed = task_embed
 
-        self.pos = nn.Parameter(
-            torch.randn(1, 1024, 256)
-        )  # positional encoding for 64 tokens
-
-        encoder_layer = nn.TransformerEncoderLayer(
+        self.transformer = FlashTransformerEncoder(
             d_model=256,
-            nhead=4,
+            nhead=8,
             dim_feedforward=1024,
-            batch_first=True,
-            activation="gelu",
-            norm_first=True,
-            dropout=0.1,
+            num_layers=6,
+            norm_first=False,
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=8)
 
         self.obs_head = nn.Sequential(
             nn.LayerNorm(256),
@@ -36,6 +26,11 @@ class MiniWorldModel(nn.Module):
         self.reward_head = nn.Sequential(
             nn.LayerNorm(256),
             nn.Linear(256, 1),
+        )
+
+        self.done_head = nn.Sequential(
+            nn.LayerNorm(256),
+            nn.Linear(256, 1),  # output done signal
         )
 
     def rollout(self, initial_obs_tokens, horizon, actor_critic, game_id):
@@ -99,41 +94,30 @@ class MiniWorldModel(nn.Module):
             pred_obs_logits: (B, T, K, 512)
             pred_rewards:    (B, T)
         """
-        assert (
-            action_tokens.max().item() < self.num_actions
-        ), f"Action token {action_tokens.max().item()} exceeds embedding limit {self.num_actions - 1}"
-
         B, T, K = obs_tokens.shape
 
-        # embed tokens
-        act_embed = self.action_embed(action_tokens).unsqueeze(
-            2
-        )  # (B, T, 1, 256)
-
-        obs_embed_with_task = self.task_embed(
-            game_ids=game_ids, obs_tokens=obs_tokens
-        )  # (B, T*K, 256)
+        obs_embed_with_task, action_embed_with_task = self.task_embed(
+            obs_tokens=obs_tokens,
+            action_tokens=action_tokens,
+            game_ids=game_ids,
+        )  # (B, T*K, 256), (B, T, 256)
 
         # interleave
         combined_embed = torch.cat(
-            [obs_embed_with_task.reshape(B, T, K, -1), act_embed], dim=2
+            [
+                obs_embed_with_task.reshape(B, T, K, -1),
+                action_embed_with_task.unsqueeze(2),
+            ],
+            dim=2,
         ).reshape(
             B, T * (K + 1), 256
         )  # (B, T, K+1, 256) -> (B, T*(K+1), 256)
 
-        # positional encoding
-        pos = self.pos[:, : combined_embed.size(1), :]  # (1, T*(K+1), 256)
-
         # add positional encoding and task embedding
-        x = combined_embed + pos  # (B, T*(K+1), 256)
-
-        # Causal mask to prevent looking ahead
-        mask = nn.Transformer.generate_square_subsequent_mask(x.size(1)).to(
-            x.device
-        )  # (T*(K+1), T*(K+1))
+        x = combined_embed
 
         # decode
-        out = self.transformer(x, mask, is_causal=True)  # (B, T*(K+1), 256)
+        out = self.transformer(x)  # (B, T*(K+1), 256)
         out = out.reshape(B, T, K + 1, 256)  # (B, T, K+1, 256)
 
         action_features = out[:, :, -1, :]  # (B, T, 256)
@@ -142,5 +126,6 @@ class MiniWorldModel(nn.Module):
             B, T, K, 512
         )  # (B, T, K, 512)
         rewards = self.reward_head(action_features).squeeze(-1)  # (B, T)
+        dones = self.done_head(action_features).squeeze(-1)  # (B, T)
 
-        return obs_logits, rewards
+        return obs_logits, rewards, dones
