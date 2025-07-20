@@ -18,7 +18,6 @@ from torch.utils.data import (
 )
 from torchvision.ops import sigmoid_focal_loss
 from tqdm import tqdm, trange
-from triton import next_power_of_2
 from vq_vae import Encoder, vq_vae
 from world_model import MiniWorldModel
 
@@ -39,6 +38,7 @@ class MultiTrajectoryDataset(Dataset):
         self.games = games
         self.horizon = horizon
         self.data = []
+        self.reward_normalizers = []
 
         for gid, game in enumerate(self.games):
             frames = self.root[game]["frames"][:]
@@ -53,6 +53,9 @@ class MultiTrajectoryDataset(Dataset):
             print(
                 f"Game {game} has {len(rewards[rewards != 0])} non-zero rewards"
             )
+
+            max_reward = np.abs(rewards).max() if np.any(rewards) else 1.0
+            self.reward_normalizers.append(max_reward)
 
             for idx in trange(len(frames) - horizon - 1):
                 end = idx + horizon
@@ -115,10 +118,15 @@ class MultiTrajectoryDataset(Dataset):
             idx
         ]
 
+        # Normalize rewards
+        max_reward = self.reward_normalizers[gid]
+        reward_seq = torch.from_numpy(reward_seq).float()
+        reward_seq = torch.clamp(reward_seq / max_reward, -1.0, 1.0)
+
         return (
             torch.from_numpy(frame_seq).float().div_(255),  # (H, 3, 84, 84)
             torch.from_numpy(action_seq).long(),  # (H,)
-            torch.from_numpy(reward_seq).float(),  # (H,)
+            reward_seq,  # (H,)
             torch.from_numpy(done_seq).bool(),  # (H,)
             torch.from_numpy(mask_seq).bool(),  # (H,)
             torch.tensor(gid, dtype=torch.long),  # game id
@@ -281,13 +289,13 @@ def compute_loss(
     )  # (B*T*16,)
     obs_loss = obs_loss[obs_masks].mean()
 
-    reward_target = (rewards.abs() > 1e-6).float()
-    reward_loss = sigmoid_focal_loss(
+    weights = torch.ones_like(rewards)
+    weights[rewards.abs() > 1e-6] = 20.0
+    reward_loss = F.huber_loss(
         pred_reward.reshape(-1),  # (B*T,)
-        reward_target.reshape(-1),  # (B*T,)
+        rewards.reshape(-1),  # (B*T,)
         reduction="none",
-        alpha=alpha,
-        gamma=gamma,
+        weight=weights.reshape(-1),
     )
     reward_loss = reward_loss[seq_masks].mean()
 
@@ -305,8 +313,6 @@ def compute_loss(
         obs_loss,
         reward_loss,
         done_loss,
-        reward_target,
-        pred_reward,
         done_target,
         pred_done,
     )
@@ -397,8 +403,6 @@ def validate(global_step):
                 obs_loss,
                 reward_loss,
                 done_loss,
-                reward_target,
-                pred_reward,
                 done_target,
                 pred_done,
             ) = compute_loss(
@@ -421,12 +425,6 @@ def validate(global_step):
         reward_loss_sum += reward_loss.item() * num_valid_steps
         done_loss_sum += done_loss.item() * num_valid_steps
 
-        reward_prob = torch.sigmoid(pred_reward)
-        reward_pred = reward_prob > 0.5
-        reward_tp += (reward_pred & reward_target.bool()).sum().item()
-        reward_pos += reward_target.sum().item()
-        reward_fp += (reward_pred & (~reward_target.bool())).sum().item()
-
         done_prob = torch.sigmoid(pred_done)
         done_pred = done_prob > 0.5
         done_tp += (done_pred & done_target.bool()).sum().item()
@@ -443,14 +441,6 @@ def validate(global_step):
 
     total_loss_epoch = obs_loss_epoch + reward_loss_epoch + done_loss_epoch
 
-    reward_precision, reward_recall, reward_f1 = compute_prf(
-        reward_tp,
-        reward_fp,
-        reward_pos,
-        nan_when_no_pos=False,
-        nan_when_no_pred_pos=True,
-    )
-
     done_precision, done_recall, done_f1 = compute_prf(
         done_tp,
         done_fp,
@@ -465,9 +455,6 @@ def validate(global_step):
             "val/reward_loss": reward_loss_epoch,
             "val/done_loss": done_loss_epoch,
             "val/total_loss": total_loss_epoch,
-            "val/reward-recall": reward_recall,
-            "val/reward-precision": reward_precision,
-            "val/reward-f1": reward_f1,
             "val/done-recall": done_recall,
             "val/done-precision": done_precision,
             "val/done-f1": done_f1,
@@ -483,14 +470,14 @@ def validate(global_step):
 # %%
 if __name__ == "__main__":
     best_val_loss = float("inf")
-    checkpoint_dir = "checkpoints_new"
+    checkpoint_dir = "checkpoints"
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     scaler = GradScaler(enabled=is_amp)
 
-    patience = 5  # 连续5次val不改善就stop
+    patience = 5
     early_stop_counter = 0
-    min_delta = 0.0001  # 最小改善阈值
+    min_delta = 0.0001
 
     run = wandb.init(
         project="pretrain-world-model",
@@ -538,8 +525,6 @@ if __name__ == "__main__":
                     obs_loss,
                     reward_loss,
                     done_loss,
-                    reward_target,
-                    pred_reward,
                     done_target,
                     pred_done,
                 ) = compute_loss(
@@ -561,25 +546,11 @@ if __name__ == "__main__":
             scaler.step(optimizer)
             scaler.update()
 
-            reward_prob = torch.sigmoid(pred_reward)
-            reward_pred = reward_prob > 0.5
-            reward_tp = (reward_pred & reward_target.bool()).sum().item()
-            reward_pos = reward_target.sum().item()
-            reward_fp = (reward_pred & (~reward_target.bool())).sum().item()
-
             done_prob = torch.sigmoid(pred_done)
             done_pred = done_prob > 0.5
             done_tp = (done_pred & done_target.bool()).sum().item()
             done_pos = done_target.sum().item()
             done_fp = (done_pred & (~done_target.bool())).sum().item()
-
-            reward_precision, reward_recall, reward_f1 = compute_prf(
-                reward_tp,
-                reward_fp,
-                reward_pos,
-                nan_when_no_pos=False,
-                nan_when_no_pred_pos=True,
-            )
 
             done_precision, done_recall, done_f1 = compute_prf(
                 done_tp,
@@ -596,9 +567,6 @@ if __name__ == "__main__":
                     "train/reward_loss": reward_loss.item(),
                     "train/done_loss": done_loss.item(),
                     "train/total_loss": loss.item(),
-                    "train/reward-recall": reward_recall,
-                    "train/reward-precision": reward_precision,
-                    "train/reward-f1": reward_f1,
                     "train/done-recall": done_recall,
                     "train/done-precision": done_precision,
                     "train/done-f1": done_f1,
