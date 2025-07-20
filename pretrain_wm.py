@@ -267,6 +267,9 @@ def preprocess_batch(
     )
 
 
+reward_weight = 20.0
+
+
 def compute_loss(
     world_model,
     curr_obs_tokens,
@@ -290,7 +293,7 @@ def compute_loss(
     obs_loss = obs_loss[obs_masks].mean()
 
     weights = torch.ones_like(rewards)
-    weights[rewards.abs() > 1e-6] = 20.0
+    weights[rewards.abs() > 1e-6] = reward_weight
     reward_loss = F.huber_loss(
         pred_reward.reshape(-1),  # (B*T,)
         rewards.reshape(-1),  # (B*T,)
@@ -490,6 +493,7 @@ if __name__ == "__main__":
             "done_head_lr": done_head_lr,
             "weight_decay": weight_decay,
             "horizon": horizon,
+            "reward_weight": reward_weight,
             "alpha": alpha,
             "gamma": gamma,
         },
